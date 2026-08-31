@@ -280,6 +280,14 @@ button{font-family:inherit;font-variant-numeric:tabular-nums;cursor:pointer;bord
 .rchip.on .rr{color:var(--ball)}
 .cell .rl3{position:absolute;bottom:3px;left:5px;font-size:8px;font-weight:800;letter-spacing:.07em;opacity:.62}
 .box .rz{font-size:8px;font-weight:800;letter-spacing:.08em;opacity:.72}
+
+.autolib{margin-top:7px;font-size:11px;font-weight:700;letter-spacing:.04em;padding:9px 0;
+  background:transparent;border:1px dashed var(--hair);color:var(--dim)}
+.autolib.on{background:rgba(78,205,196,.14);border:1px solid var(--lib);color:var(--lib)}
+.cell.held{filter:brightness(1.35)}
+.cell{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+.bigbuf{font-size:38px;font-weight:800;text-align:center;letter-spacing:-.03em;padding:6px 0 12px}
+.bigbuf .ph{opacity:.3}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -394,7 +402,7 @@ function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
 function newTeam(name, color) {
   return {
-    name: name, color: color || "#1E6FD9", system: "5-1", setterNum: null, roles: null, roster: [], liberos: [],
+    name: name, color: color || "#1E6FD9", system: "5-1", setterNum: null, roles: null, autoLib: false, roster: [], liberos: [],
     order: [], startOrder: [], rot: 0,
     playerSlot: {},      // jersey -> serving-order slot they are locked to this set
     libOn: null,         // { n: jersey, slot: index }
@@ -470,6 +478,46 @@ function rotate(ti) {
   }
 }
 
+/* Auto libero tracking.
+   Middles sit three apart in the serving order, so exactly one of them is
+   always in the back row. The libero shadows whichever middle that is:
+   in when the middle reaches the back row, out when that spot rotates to
+   the front — at which moment the other middle has just arrived in the back.
+
+   Two cases where we hold off rather than act:
+   - the spot is at zone 1 and the team must serve from it, and the libero's
+     serving slot is already committed elsewhere. The middle serves that turn.
+   - no libero registered, or roles never tagged.
+   Returns the slot to fill, or null. */
+function autoLiberoTargetFor(t, rally, serving) {
+  if (!t.autoLib || !t.liberos.length || !t.roles) return null;
+  if (t.libOn) return null;
+  for (var slot = 0; slot < 6; slot++) {
+    if (t.roles[slot] !== "MB") continue;
+    var z = zoneOfSlot(t, slot);
+    if (BACK_ZONES.indexOf(z) === -1) continue;
+    // would have to serve from here, but the libero is committed to another slot
+    if (z === 0 && serving && t.libServeSlot !== null && t.libServeSlot !== slot) return null;
+    if (t.lastLibRally === rally && t.lastLibSlot === slot) return null;
+    return slot;
+  }
+  return null;
+}
+function autoLiberoTarget(ti) {
+  return autoLiberoTargetFor(S.teams[ti], S.rally, S.serve === ti);
+}
+
+function runAutoLibero(ti) {
+  var t = S.teams[ti];
+  var slot = autoLiberoTarget(ti);
+  if (slot === null) return;
+  t.libOn = { n: t.liberos[0], slot: slot };
+  t.lastLibRally = S.rally;
+  ev({ k: "libin", t: ti, slot: slot, n: t.libOn.n, "for": t.order[slot], a: S.score[0], b: S.score[1] });
+  say(t.name + ": libero #" + t.libOn.n + " in for #" + t.order[slot] + " (auto)", "lb");
+  checkLiberoServe(ti);
+}
+
 function checkLiberoServe(ti) {
   var t = S.teams[ti];
   if (!t.libOn) return;
@@ -495,6 +543,7 @@ function point(ti) {
   ev({ k: "pt", t: ti, a: S.score[0], b: S.score[1], so: sideOut, srv: atZone(t, 0) });
   say(t.name + " point" + (sideOut ? " · side out, rotate" : " · #" + atZone(t, 0) + " serving again"));
   checkLiberoServe(ti);
+  runAutoLibero(0); runAutoLibero(1);
   // side switch reminder in the deciding set
   if (isDeciding() && !S.sideSwitched && (S.score[0] >= 8 || S.score[1] >= 8)) {
     S.sideSwitched = true;
@@ -563,6 +612,91 @@ function doSub(ti, slot, inN) {
   save(); closeSheet(); render();
 }
 
+function toggleAutoLib(ti) {
+  var t = S.teams[ti];
+  if (!t.autoLib) {
+    if (!t.liberos.length) return toast(t.name + " has no libero registered this set");
+    if (!t.roles) return toast("Tag the setter first — long-press a player to do it");
+  }
+  snap();
+  t.autoLib = !t.autoLib;
+  if (t.autoLib) {
+    say(t.name + ": libero tracking on — following the back-row middle", "lb");
+    runAutoLibero(ti);
+    toast("Libero tracking on", true);
+  } else {
+    say(t.name + ": libero tracking off", "lb");
+    toast("Libero tracking off");
+  }
+  save(); render();
+}
+
+/* ---------- fixing a mistyped number ---------- */
+/* Not a substitution: the player was always there, we just typed them wrong.
+   No sub is spent, no slot lock is created, and the score sheet is rewritten
+   so the set reads as if the right number had been entered all along. */
+function correctProblem(t, slot, n, isLib) {
+  if (!n) return "Punch in a jersey number";
+  var court = onCourt(t);
+  var self = isLib ? (t.libOn && t.libOn.n) : t.order[slot];
+  if (n === self) return null;
+  if (court.indexOf(n) !== -1) return "#" + n + " is already on the court";
+  if (!isLib && t.liberos.indexOf(n) !== -1) return "#" + n + " is your libero";
+  if (isLib && t.order.indexOf(n) !== -1) return "#" + n + " is in the serving order";
+  return null;
+}
+
+function correctNumber(ti, slot, newN, isLib) {
+  var t = S.teams[ti];
+  var bad = correctProblem(t, slot, newN, isLib);
+  if (bad) return toast(bad);
+  var oldN = isLib ? t.libOn.n : t.order[slot];
+  if (oldN === newN) { closeSheet(); return; }
+  snap();
+
+  if (isLib) {
+    var li = t.liberos.indexOf(oldN);
+    if (li !== -1) t.liberos[li] = newN;
+    if (t.libOn) t.libOn.n = newN;
+  } else {
+    t.order[slot] = newN;
+    if (t.playerSlot[oldN] === slot) delete t.playerSlot[oldN];
+    t.playerSlot[newN] = slot;
+    if (t.startOrder && t.startOrder[slot] === oldN) t.startOrder[slot] = newN;
+    if (t.setterNum === oldN) t.setterNum = newN;
+  }
+  t.roster.forEach(function (p) { if (p.n === oldN) p.n = newN; });
+
+  // rewrite this set's events so the score sheet matches
+  S.events.forEach(function (e) {
+    if (e.set !== S.set || e.t !== ti) {
+      if (e.k === "start" && e.set === S.set) {
+        if (!isLib) { e.lineups[ti] = e.lineups[ti].map(function (v) { return v === oldN ? newN : v; }); }
+        else { e.liberos[ti] = e.liberos[ti].map(function (v) { return v === oldN ? newN : v; }); }
+      }
+      return;
+    }
+    if (e.k === "sub") { if (e.out === oldN) e.out = newN; if (e["in"] === oldN) e["in"] = newN; }
+    if (e.k === "libin") { if (e.n === oldN) e.n = newN; if (e["for"] === oldN) e["for"] = newN; }
+    if (e.k === "libserve" && e.n === oldN) e.n = newN;
+  });
+
+  say(t.name + ": corrected #" + oldN + " to #" + newN + (isLib ? " (libero)" : ""), "lb");
+  toast("Fixed — #" + oldN + " is now #" + newN, true);
+  save(); closeSheet(); render();
+}
+
+/* Tag the setter mid-match; the other five roles follow from the
+   three-apart pattern and ride along through subs and rotations. */
+function setSetter(ti, slot) {
+  var t = S.teams[ti];
+  snap();
+  t.roles = deriveRoles(slot, t.system || "5-1");
+  t.setterNum = t.order[slot];
+  say(t.name + ": #" + t.order[slot] + " tagged as setter (" + ROMAN[slot] + ")", "lb");
+  save(); closeSheet(); render();
+}
+
 /* ---------- libero ---------- */
 function liberoIn(ti, libN, slot) {
   var t = S.teams[ti];
@@ -622,10 +756,12 @@ function confirmLineup(ti) {
   t.playerSlot = {};
   six.forEach(function (n, i) { t.playerSlot[n] = i; });
   t.liberos = libs;
-  t.roles = e.roles ? e.roles.slice() : null;
-  if (t.roles) {
-    var si = t.roles.indexOf("S");
-    if (si !== -1) t.setterNum = six[si];
+  // setter carries between sets by jersey number; roles re-derive around wherever they landed
+  if (t.setterNum) {
+    var si = six.indexOf(t.setterNum);
+    t.roles = si === -1 ? null : deriveRoles(si, t.system || "5-1");
+  } else {
+    t.roles = null;
   }
   t.roster = six.map(function (n) { return { n: n, lib: false }; })
     .concat(libs.map(function (n) { return { n: n, lib: true }; }));
@@ -759,13 +895,12 @@ function viewLineup() {
         '<div class="entry" style="margin-bottom:15px">' + [4, 5, 0].map(entryBox).join("") + '</div>') +
     '<div class="entry" style="grid-template-columns:1fr 1fr">' + [6, 7].map(entryBox).join("") + '</div>' +
     keypad("Next") +
-    rolePicker(ti, filled) +
     '<div class="hair"></div>' +
     '<button class="btn primary wide" data-ok="' + ti + '">' +
       (filled < 6 ? (6 - filled) + " more to go" : (last ? "Start set " + S.set : "Next — " + esc(S.teams[1].name))) +
     '</button>' +
     (e.prefilled ? '<button class="btn ghost wide" id="clr" style="margin-top:8px;opacity:.65;font-size:12px">Clear and start over</button>' : "") +
-    '<p class="note">Zone 1 serves first for this team. Leave the libero blank if you\'re not tracking one.</p>';
+    '<p class="note">Zone 1 serves first for this team. Leave the libero blank if you\'re not tracking one. Once play starts, long-press a player to tag your setter or fix a number.</p>';
 }
 
 function rolePicker(ti, filled) {
@@ -839,7 +974,8 @@ function cell(ti, z) {
   var libSpot = t.libServeSlot === slot;
   var s = tStyle(ti);
   var sty = 'background:' + s.fill + ';color:' + s.text + ';border-color:' + s.line;
-  return '<div class="cell' + (serving ? " serving" : "") + (isLib ? " libero" : "") + '" style="' + sty + '">' +
+  return '<div class="cell' + (serving ? " serving" : "") + (isLib ? " libero" : "") +
+    '" data-cell="' + ti + "|" + slot + '" style="' + sty + '">' +
     '<span class="z">' + (z + 1) + (isLib ? " · L" : "") + '</span>' +
     (serving ? '<span class="ball">●</span>' : "") +
     '<span class="num">' + esc(n || "—") + '</span>' +
@@ -911,7 +1047,10 @@ function strip(ti) {
       '<button class="btn" data-sub="' + ti + '" style="' + bs + '">Sub</button>' +
       '<button class="btn" data-libx="' + ti + '" style="' + bs + '">' + lib + '</button>' +
       '<button class="btn" data-to="' + ti + '" style="' + bs + '">Timeout</button>' +
-    '</div></div>';
+    '</div>' +
+    '<button class="btn wide autolib' + (t.autoLib ? " on" : "") + '" data-autolib="' + ti + '">' +
+      (t.autoLib ? "✓ Libero tracking on" : "Auto-track libero") + '</button>' +
+    '</div>';
 }
 
 function viewBreak() {
@@ -1102,6 +1241,31 @@ function drawSheet() {
   if (!sheet) return;
   var t = S.teams[sheet.ti], html = "";
 
+  if (sheet.kind === "cell") {
+    var cslot = sheet.extra, onLib = !!(t.libOn && t.libOn.slot === cslot);
+    var who = onLib ? t.libOn.n : t.order[cslot];
+    if (sheet.mode === "fix") {
+      html = '<h3>Correct #' + esc(who) + '</h3>' +
+        '<p class="sub">Fixes a number typed wrong at line-up. This is not a substitution — no sub is spent, and the score sheet is rewritten to match.' +
+        (onLib ? ' Changing the libero\'s number.' : '') + '</p>' +
+        '<div class="bigbuf">' + (sheet.buf ? esc(sheet.buf) : '<span class="ph">–</span>') + '</div>' +
+        keypad("Save") +
+        '<div class="hair"></div><button class="btn ghost wide" data-cellback="1">Back</button>';
+    } else {
+      var role = t.roles && t.roles[cslot];
+      html = '<h3>#' + esc(who) + ' — ' + ZONE_NAME[zoneOfSlot(t, cslot)].split(" · ")[0] + '</h3>' +
+        '<p class="sub">Serving order ' + ROMAN[cslot] + (role ? ' · ' + (ROLE_FULL[role] || role) : '') +
+        (onLib ? ' · libero on court here' : '') + '</p>' +
+        '<button class="btn wide" data-cellfix="1">Correct this number</button>' +
+        '<div style="height:8px"></div>' +
+        (onLib ? '<p class="sub">Take the libero out to tag the player underneath as setter.</p>'
+               : '<button class="btn wide" data-setter="1">Tag as setter' +
+                 (role === "S" ? ' (already)' : '') + '</button>' +
+                 '<p class="sub" style="margin-top:8px">Sets the other five roles from the three-apart pattern. Roles stay with the spot, so subs inherit them.</p>') +
+        '<div class="hair"></div><button class="btn ghost wide" data-close="1">Close</button>';
+    }
+  }
+
   if (sheet.kind === "sub") {
     if (sheet.extra === null) {
       html = '<h3>Substitution — ' + esc(t.name) + '</h3>' +
@@ -1176,21 +1340,61 @@ function wire() { /* nothing rebuilt per-render needs binding */ }
 
 /* Bound exactly once at boot — #app survives every render, so re-binding here
    would stack duplicate handlers and fire each tap several times. */
+/* Long-press a player to correct their number or tag them setter.
+   Cancels on movement so scrolling the court never triggers it. */
+function wireLongPress() {
+  var lpT = null, lpX = 0, lpY = 0, lpEl = null;
+  function clear() { clearTimeout(lpT); lpT = null; lpEl = null; }
+  document.addEventListener("pointerdown", function (e) {
+    var c = e.target.closest("[data-cell]");
+    if (!c || S.phase !== "match") return;
+    lpEl = c; lpX = e.clientX; lpY = e.clientY;
+    clearTimeout(lpT);
+    lpT = setTimeout(function () {
+      if (!lpEl) return;
+      var p = lpEl.getAttribute("data-cell").split("|");
+      lpEl.classList.add("held");
+      if (navigator.vibrate) { try { navigator.vibrate(18); } catch (err) {} }
+      openSheet("cell", +p[0], +p[1]);
+      clear();
+    }, 500);
+  }, { passive: true });
+  document.addEventListener("pointermove", function (e) {
+    if (lpT && (Math.abs(e.clientX - lpX) > 10 || Math.abs(e.clientY - lpY) > 10)) clear();
+  }, { passive: true });
+  ["pointerup", "pointercancel", "scroll"].forEach(function (evt) {
+    document.addEventListener(evt, clear, { passive: true });
+  });
+  document.addEventListener("contextmenu", function (e) {
+    if (e.target.closest("[data-cell]")) e.preventDefault();
+  });
+}
+
 function wireOnce() {
   document.addEventListener("click", function (e) {
     if (!e.target || !e.target.closest) return;
 
     /* --- open sheet takes priority --- */
     if (sheet) {
-      var sel = e.target.closest("[data-subslot],[data-subin],[data-libin],[data-libout],[data-libpick],[data-close],[data-key]");
+      var sel = e.target.closest("[data-subslot],[data-subin],[data-libin],[data-libout],[data-libpick],[data-close],[data-key],[data-cellfix],[data-cellback],[data-setter]");
       if (sel) {
         var v;
         if (sel.getAttribute("data-close")) return closeSheet();
+        if (sel.getAttribute("data-cellfix")) { sheet.mode = "fix"; sheet.buf = ""; return drawSheet(); }
+        if (sel.getAttribute("data-cellback")) { sheet.mode = null; sheet.buf = ""; return drawSheet(); }
+        if (sel.getAttribute("data-setter")) { return setSetter(sheet.ti, sheet.extra); }
         if ((v = sel.getAttribute("data-subslot")) !== null) { sheet.extra = v === "back" ? null : +v; sheet.buf = ""; return drawSheet(); }
         if ((v = sel.getAttribute("data-key")) !== null) {
           var b = sheet.buf || "";
           if (v === "del") sheet.buf = b.slice(0, -1);
-          else if (v === "ok") return doSub(sheet.ti, sheet.extra, b);
+          else if (v === "ok") {
+            if (sheet.kind === "cell") {
+              var ct = S.teams[sheet.ti];
+              var wasLib = !!(ct.libOn && ct.libOn.slot === sheet.extra);
+              return correctNumber(sheet.ti, sheet.extra, b, wasLib);
+            }
+            return doSub(sheet.ti, sheet.extra, b);
+          }
           else sheet.buf = b.length >= 2 ? v : b + v;
           return drawSheet();
         }
@@ -1203,7 +1407,7 @@ function wireOnce() {
       if (e.target.closest(".sheet")) return;
     }
 
-    var el = e.target.closest("[data-box],[data-key],[data-ok],[data-pt],[data-sub],[data-libx],[data-to],[data-view],[data-color],[data-sys],[data-role],#go,#undo,#newm,#nxt,#print,#dl,#clr");
+    var el = e.target.closest("[data-box],[data-key],[data-ok],[data-pt],[data-sub],[data-libx],[data-to],[data-view],[data-color],[data-sys],[data-role],[data-autolib],#go,#undo,#newm,#nxt,#print,#dl,#clr");
     if (!el) return;
     var d;
     if ((d = el.getAttribute("data-box")) !== null) {
@@ -1215,6 +1419,7 @@ function wireOnce() {
     }
     if ((d = el.getAttribute("data-key")) !== null) { entryKey(d); return; }
     if ((d = el.getAttribute("data-view"))) { S.view = d; save(); render(); return; }
+    if ((d = el.getAttribute("data-autolib")) !== null) { toggleAutoLib(+d); return; }
     if ((d = el.getAttribute("data-sys"))) {
       var sp = d.split("|");
       S.teams[+sp[0]].system = sp[1];
@@ -1318,6 +1523,7 @@ function boot() {
     if (!S.undo) S.undo = [];
     if (S.phase === "lineup" && !S.entry) S.entry = entryFor(S.lineupFor || 0);
     wireOnce();
+  wireLongPress();
     render();
   }, function () { S = newMatch(); wireOnce(); render(); });
 }
