@@ -1,5 +1,5 @@
 /* Side Out — offline cache. Bump CACHE to push an update to installed phones. */
-var CACHE = "rally-v1";
+var CACHE = "rally-v2";
 var ASSETS = ["./", "./index.html", "./manifest.webmanifest",
               "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
