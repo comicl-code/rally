@@ -1305,29 +1305,36 @@ function zoneOf(ti, z) { return ti === 0 ? HOME_X[z] : AWAY_X[z]; }
 /* Rotational base: the legal reference spot for each zone. */
 function basePos(ti, z) {
   var front = FRONT_ZONES.indexOf(z) !== -1;
-  var y = ti === 0 ? (front ? 7.6 : 2.9) : (front ? 10.4 : 15.1);
+  var y = ti === 0 ? (front ? 7.5 : 3.0) : (front ? 10.5 : 15.0);
   return { x: zoneOf(ti, z), y: y };
 }
 
 /* Serve-receive template. Passers spread across an arc; the setter releases
    toward their own right front; everyone else waits at the net to hit. */
+/* Positive amount moves toward the team's OWN left, which is screen-right
+   for home and screen-left for away. */
+function shiftX(ti, x, amount) {
+  var v = ti === 0 ? x + amount : x - amount;
+  return Math.max(0.85, Math.min(CW - 0.85, v));
+}
+
 function receivePos(ti, z, role, passers, isServer) {
-  var t = S.teams[ti], nearNet = ti === 0 ? 7.6 : 10.4;
+  var nearNet = ti === 0 ? 7.6 : 10.4;
   var deep = function (m) { return ti === 0 ? m : CL - m; };
-  var setterSide = ti === 0 ? 2.6 : CW - 2.6;         // own right front
+  var shift = S.shift === "L" ? 1.25 : S.shift === "R" ? -1.25 : 0;
+  var dz = S.rdepth === "up" ? 1.3 : S.rdepth === "deep" ? -1.3 : 0;
+  var setterSide = ti === 0 ? 2.5 : CW - 2.5;         // own right front
   if (role === "S") return { x: setterSide, y: nearNet };
-  var order = passers === 2 ? [2.8, 6.2] : passers === 3 ? [1.9, 4.5, 7.1] : [1.6, 3.6, 5.4, 7.4];
+  var order = passers === 2 ? [2.9, 6.1] : passers === 3 ? [1.9, 4.5, 7.1] : [1.5, 3.5, 5.5, 7.5];
   var idx = passerIndex(ti, z, passers);
   if (idx !== -1) {
-    var depth = passers === 2 ? 5.2 : passers === 3 ? 4.4 : 3.8;
-    var x = order[idx];
-    // middle passer sits a touch shallower than the wings
-    var bump = (passers === 3 && idx === 1) ? -0.5 : 0;
-    return { x: x, y: deep(depth + bump) };
+    var depth = passers === 2 ? 5.0 : passers === 3 ? 4.3 : 3.7;
+    // wings hang a little deeper than the middle, giving the shallow arc
+    var bump = passers === 3 ? (idx === 1 ? 0.55 : 0) : passers === 4 ? (idx === 0 || idx === 3 ? -0.35 : 0.3) : 0;
+    return { x: shiftX(ti, order[idx], shift), y: deep(depth + bump + dz) };
   }
-  // anyone not passing holds their own rotational lane so nobody stacks up
   var frontRow = FRONT_ZONES.indexOf(z) !== -1;
-  return { x: zoneOf(ti, z), y: frontRow ? nearNet : deep(6.6) };
+  return { x: shiftX(ti, zoneOf(ti, z), shift * 0.45), y: frontRow ? nearNet : deep(6.5) };
 }
 
 /* Which players receive. Libero always passes; then outsides; then whoever is left,
@@ -1357,9 +1364,12 @@ function passerIndex(ti, z, passers) { return passerZones(ti, passers).indexOf(z
 /* Base defence for the serving team: blockers at the net, diggers back, server behind the line. */
 function defendPos(ti, z, isServer) {
   var front = FRONT_ZONES.indexOf(z) !== -1;
-  if (isServer) return { x: zoneOf(ti, z), y: ti === 0 ? -1.1 : CL + 1.1 };
-  var y = front ? (ti === 0 ? 8.0 : 10.0) : (ti === 0 ? 3.6 : CL - 3.6);
-  return { x: zoneOf(ti, z), y: y };
+  if (isServer) return { x: zoneOf(ti, z), y: ti === 0 ? -1.15 : CL + 1.15 };
+  var deep = function (m) { return ti === 0 ? m : CL - m; };
+  if (front) return { x: zoneOf(ti, z), y: ti === 0 ? 8.1 : 9.9 };   // blockers press the net
+  // zone 6 either steps up behind the block for tips, or holds deep for the swing
+  if (z === 6) return { x: zoneOf(ti, z), y: deep(S.defSys === "6up" ? 5.4 : 1.5) };
+  return { x: zoneOf(ti, z), y: deep(3.3) };
 }
 
 /* Does the drawn formation still satisfy the overlap rule? */
@@ -1389,25 +1399,63 @@ function overlapIssues(ti, spots) {
 function repairOverlap(ti, spots) {
   var toL = function (x) { return ti === 0 ? x : CW - x; };
   var fromL = function (v) { return ti === 0 ? v : CW - v; };
+  var GAP = 2.1, DGAP = 2.0;                 // a dot is 1.84 across, so leave room
   [[4, 3, 2], [5, 6, 1]].forEach(function (row) {
     var vals = row.map(function (z) { return toL(spots[z].x); }).sort(function (a, b) { return b - a; });
-    // ties are illegal too — the order has to be strict, so force real separation
     for (var i = 1; i < vals.length; i++) {
-      if (vals[i] > vals[i - 1] - 0.7) vals[i] = vals[i - 1] - 0.9;
+      if (vals[i] > vals[i - 1] - GAP) vals[i] = vals[i - 1] - GAP;
     }
-    var lo = Math.min.apply(null, vals);
-    var shift = lo < 0.8 ? 0.8 - lo : 0;
-    row.forEach(function (z, i) { spots[z].x = fromL(Math.min(CW - 0.8, vals[i] + shift)); });
+    // keep the row where the formation put it — force-centring here would wipe
+    // out a deliberate pull left or right — and only slide it in if it overflows
+    var origMean = row.reduce(function (s, z) { return s + toL(spots[z].x); }, 0) / row.length;
+    var newMean = vals.reduce(function (s, v) { return s + v; }, 0) / vals.length;
+    var delta = origMean - newMean;
+    var hi = vals[0] + delta, lo2 = vals[vals.length - 1] + delta;
+    if (lo2 < 0.85) delta += 0.85 - lo2;
+    if (hi > CW - 0.85) delta -= hi - (CW - 0.85);
+    row.forEach(function (z, i) { spots[z].x = fromL(vals[i] + delta); });
   });
   OVERLAP_FB.forEach(function (p) {
     var f = spots[p[0]], b = spots[p[1]];
-    var okNow = ti === 0 ? b.y < f.y : b.y > f.y;
+    var okNow = ti === 0 ? b.y <= f.y - DGAP : b.y >= f.y + DGAP;
     if (okNow) return;
-    // push the back player deeper rather than averaging, which would drag a
-    // deep passer up onto the net
-    if (ti === 0) b.y = Math.max(0.8, f.y - 1.5);
-    else b.y = Math.min(CL - 0.8, f.y + 1.5);
+    if (ti === 0) b.y = Math.max(0.9, f.y - DGAP);
+    else b.y = Math.min(CL - 0.9, f.y + DGAP);
   });
+  return spots;
+}
+
+/* The overlap rule says nothing about, say, zone 2 versus zone 5, so two players
+   can still be drawn on top of each other. Push any overlapping pair apart, then
+   re-impose the rule, until the picture is both legal and readable. */
+function relaxDots(ti, spots, skip) {
+  var MIN = 2.0, zs = [1, 2, 3, 4, 5, 6];
+  for (var iter = 0; iter < 30; iter++) {
+    var moved = false;
+    for (var i = 0; i < 6; i++) {
+      for (var j = i + 1; j < 6; j++) {
+        var za = zs[i], zb = zs[j];
+        if (skip[za] || skip[zb]) continue;
+        var a = spots[za], b = spots[zb];
+        var dx = b.x - a.x, dy = b.y - a.y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d >= MIN) continue;
+        var ux = d > 0.001 ? dx / d : 0, uy = d > 0.001 ? dy / d : 1;
+        var push = (MIN - d) / 2 + 0.02;
+        a.x -= ux * push; a.y -= uy * push;
+        b.x += ux * push; b.y += uy * push;
+        moved = true;
+      }
+    }
+    zs.forEach(function (z) {
+      if (skip[z]) return;
+      spots[z].x = Math.max(0.85, Math.min(CW - 0.85, spots[z].x));
+      spots[z].y = ti === 0 ? Math.max(0.9, Math.min(8.3, spots[z].y))
+                            : Math.max(CL - 8.3, Math.min(CL - 0.9, spots[z].y));
+    });
+    repairOverlap(ti, spots);
+    if (!moved) break;
+  }
   return spots;
 }
 
@@ -1426,7 +1474,12 @@ function posSpots(ti) {
     spots[z] = p;
     meta[z] = { n: isLib ? t.libOn.n : t.order[slot], role: isLib ? "L" : role, lib: isLib, server: isServer, slot: slot };
   }
-  if (mode !== "rot") repairOverlap(ti, spots);
+  if (mode !== "rot") {
+    var skip = {};
+    for (var z2 = 1; z2 <= 6; z2++) if (meta[z2] && meta[z2].server) skip[z2] = true;
+    repairOverlap(ti, spots);
+    relaxDots(ti, spots, skip);
+  }
   return { spots: spots, meta: meta, serving: serving };
 }
 
@@ -1453,10 +1506,11 @@ function viewPositions() {
       var fill = m.lib ? "var(--lib)" : st.fill === "transparent" ? "#22303B" : st.fill;
       var ink = m.lib ? "#06211D" : st.text;
       svg += '<g>' +
-        (m.server ? '<circle cx="' + sx(p.x) + '" cy="' + sy(p.y) + '" r="1.16" fill="none" stroke="var(--ball)" stroke-width=".16"/>' : "") +
-        '<circle cx="' + sx(p.x) + '" cy="' + sy(p.y) + '" r=".92" fill="' + fill + '" stroke="' + (m.lib ? "var(--lib)" : st.line) + '" stroke-width=".1"/>' +
-        '<text x="' + sx(p.x) + '" y="' + (sy(p.y) + 0.22) + '" text-anchor="middle" font-size=".72" font-weight="800" fill="' + ink + '">' + esc(m.n) + '</text>' +
-        (m.role ? '<text x="' + sx(p.x) + '" y="' + (sy(p.y) + ((ti === 0) !== !!m.server ? -1.25 : 1.68)) + '" text-anchor="middle" font-size=".5" font-weight="700" fill="#9FB3C0">' + m.role + '</text>' : "") +
+        (m.server ? '<circle cx="' + sx(p.x) + '" cy="' + sy(p.y) + '" r="1.2" fill="none" stroke="var(--ball)" stroke-width=".16"/>' : "") +
+        '<circle cx="' + sx(p.x) + '" cy="' + sy(p.y) + '" r=".95" fill="' + fill + '" stroke="' + (m.lib ? "var(--lib)" : st.line) + '" stroke-width=".1"/>' +
+        '<text x="' + sx(p.x) + '" y="' + (sy(p.y) + (m.role ? 0.03 : 0.25)) + '" text-anchor="middle" font-size="' +
+          (m.role ? ".64" : ".74") + '" font-weight="800" fill="' + ink + '">' + esc(m.n) + '</text>' +
+        (m.role ? '<text x="' + sx(p.x) + '" y="' + (sy(p.y) + 0.66) + '" text-anchor="middle" font-size=".34" font-weight="800" letter-spacing=".02" fill="' + ink + '" opacity=".72">' + m.role + '</text>' : "") +
         '</g>';
     });
   });
@@ -1480,6 +1534,19 @@ function viewPositions() {
       ? '<div class="seg3 noprint" style="margin-top:7px">' +
           [2, 3, 4].map(function (n) {
             return '<button class="segb' + (passers === n ? " on" : "") + '" data-pass="' + n + '">' + n + ' passers</button>';
+          }).join("") + '</div>' +
+        '<div class="seg3 noprint" style="margin-top:6px">' +
+          [["L", "Pull left"], ["E", "Even"], ["R", "Pull right"]].map(function (o) {
+            return '<button class="segb' + ((S.shift || "E") === o[0] ? " on" : "") + '" data-shift="' + o[0] + '">' + o[1] + '</button>';
+          }).join("") + '</div>' +
+        '<div class="seg3 noprint" style="margin-top:6px">' +
+          [["up", "Short serve"], ["base", "Base"], ["deep", "Deep serve"]].map(function (o) {
+            return '<button class="segb' + ((S.rdepth || "base") === o[0] ? " on" : "") + '" data-rdepth="' + o[0] + '">' + o[1] + '</button>';
+          }).join("") + '</div>'
+      : mode === "def"
+      ? '<div class="seg noprint" style="margin-top:7px;grid-template-columns:1fr 1fr">' +
+          [["6back", "6-back"], ["6up", "6-up"]].map(function (o) {
+            return '<button class="segb' + ((S.defSys || "6back") === o[0] ? " on" : "") + '" data-defsys="' + o[0] + '">' + o[1] + '</button>';
           }).join("") + '</div>'
       : "") +
     svg + warn +
@@ -1491,8 +1558,12 @@ function viewPositions() {
       (mode === "rot"
         ? "Where each player must stand at the moment of serve. This is the rule baseline — the relative order here is what referees judge."
         : mode === "recv"
-        ? "Receiving team in a " + passers + "-passer look; serving team in base. These are legal positions at the whistle — the setter and hitters release to the net the instant the ball is contacted. Formations vary by team, so treat the shape as a starting point."
-        : "Serving team in base defence, server behind the end line. The receiving side is shown at its rotational spots.") +
+        ? "Receiving team in a " + passers + "-passer look" +
+          (S.shift === "L" ? ", pulled to their left" : S.shift === "R" ? ", pulled to their right" : "") +
+          (S.rdepth === "up" ? ", stepped up for a short serve" : S.rdepth === "deep" ? ", dropped for a deep or jump serve" : "") +
+          "; serving team in base. These are legal positions at the whistle — the setter and hitters release to the net the instant the ball is contacted. Formations vary by team, so treat the shape as a starting point."
+        : "Serving team in " + ((S.defSys || "6back") === "6up" ? "6-up — zone 6 steps in behind the block to cover tips" : "6-back — zone 6 holds deep for the hard swing") +
+          ", server behind the end line. The receiving side is shown at its rotational spots.") +
       ' Once the server contacts the ball everyone may move, subject to the back-row attack and libero restrictions.</p>' +
   '</div>';
 }
@@ -1685,7 +1756,7 @@ function wireOnce() {
       if (e.target.closest(".sheet")) return;
     }
 
-    var el = e.target.closest("[data-box],[data-key],[data-ok],[data-pt],[data-sub],[data-libx],[data-to],[data-view],[data-color],[data-sys],[data-role],[data-autolib],[data-pos],[data-pass],#go,#undo,#newm,#nxt,#print,#dl,#clr");
+    var el = e.target.closest("[data-box],[data-key],[data-ok],[data-pt],[data-sub],[data-libx],[data-to],[data-view],[data-color],[data-sys],[data-role],[data-autolib],[data-pos],[data-pass],[data-shift],[data-rdepth],[data-defsys],#go,#undo,#newm,#nxt,#print,#dl,#clr");
     if (!el) return;
     var d;
     if ((d = el.getAttribute("data-box")) !== null) {
@@ -1700,6 +1771,9 @@ function wireOnce() {
     if ((d = el.getAttribute("data-autolib")) !== null) { toggleAutoLib(+d); return; }
     if ((d = el.getAttribute("data-pos"))) { S.posMode = d; save(); render(); return; }
     if ((d = el.getAttribute("data-pass"))) { S.passers = +d; save(); render(); return; }
+    if ((d = el.getAttribute("data-shift"))) { S.shift = d; save(); render(); return; }
+    if ((d = el.getAttribute("data-rdepth"))) { S.rdepth = d; save(); render(); return; }
+    if ((d = el.getAttribute("data-defsys"))) { S.defSys = d; save(); render(); return; }
     if ((d = el.getAttribute("data-sys"))) {
       var sp = d.split("|");
       S.teams[+sp[0]].system = sp[1];
