@@ -402,7 +402,7 @@ function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
 function newTeam(name, color) {
   return {
-    name: name, color: color || "#1E6FD9", system: "5-1", setterNum: null, roles: null, autoLib: false, roster: [], liberos: [],
+    name: name, color: color || "#1E6FD9", system: "5-1", setterNum: null, roles: null, autoLib: false, libServePlan: null, libServePlanNum: null, roster: [], liberos: [],
     order: [], startOrder: [], rot: 0,
     playerSlot: {},      // jersey -> serving-order slot they are locked to this set
     libOn: null,         // { n: jersey, slot: index }
@@ -489,6 +489,12 @@ function rotate(ti) {
      serving slot is already committed elsewhere. The middle serves that turn.
    - no libero registered, or roles never tagged.
    Returns the slot to fill, or null. */
+/* Which slot the libero is permitted to serve from: the rule-lock once they've
+   actually served, otherwise the coach's declared plan. */
+function servePermit(t) {
+  return t.libServeSlot !== null ? t.libServeSlot : t.libServePlan;
+}
+
 function autoLiberoTargetFor(t, rally, serving) {
   if (!t.autoLib || !t.liberos.length || !t.roles) return null;
   if (t.libOn) return null;
@@ -497,7 +503,8 @@ function autoLiberoTargetFor(t, rally, serving) {
     var z = zoneOfSlot(t, slot);
     if (BACK_ZONES.indexOf(z) === -1) continue;
     // would have to serve from here, but the libero is committed to another slot
-    if (z === 0 && serving && t.libServeSlot !== null && t.libServeSlot !== slot) return null;
+    var permit = servePermit(t);
+    if (z === 0 && serving && permit !== null && permit !== slot) return null;
     if (t.lastLibRally === rally && t.lastLibSlot === slot) return null;
     return slot;
   }
@@ -509,6 +516,16 @@ function autoLiberoTarget(ti) {
 
 function runAutoLibero(ti) {
   var t = S.teams[ti];
+  if (!t.autoLib) return;
+  if (t.libOn && zoneOfSlot(t, t.libOn.slot) === 0 && S.serve === ti) {
+    var permit = servePermit(t);
+    if (permit !== null && permit !== t.libOn.slot) {
+      var lib = t.libOn.n, back = t.order[t.libOn.slot];
+      t.lastLibSlot = t.libOn.slot;
+      t.libOn = null; t.lastLibRally = S.rally;
+      say(t.name + ": #" + lib + " out so #" + back + " can serve (auto)", "lb");
+    }
+  }
   var slot = autoLiberoTarget(ti);
   if (slot === null) return;
   t.libOn = { n: t.liberos[0], slot: slot };
@@ -521,6 +538,9 @@ function runAutoLibero(ti) {
 function checkLiberoServe(ti) {
   var t = S.teams[ti];
   if (!t.libOn) return;
+  // standing in zone 1 while receiving is not serving — the rule only fixes the
+  // slot once the libero actually serves from it
+  if (S.serve !== ti) return;
   var serveSlot = slotAtZone(t, 0);
   if (t.libOn.slot !== serveSlot) return;           // libero isn't the server
   if (t.libServeSlot === null) {
@@ -542,8 +562,8 @@ function point(ti) {
   if (sideOut) { S.serve = ti; rotate(ti); }
   ev({ k: "pt", t: ti, a: S.score[0], b: S.score[1], so: sideOut, srv: atZone(t, 0) });
   say(t.name + " point" + (sideOut ? " · side out, rotate" : " · #" + atZone(t, 0) + " serving again"));
-  checkLiberoServe(ti);
   runAutoLibero(0); runAutoLibero(1);
+  checkLiberoServe(ti);
   // side switch reminder in the deciding set
   if (isDeciding() && !S.sideSwitched && (S.score[0] >= 8 || S.score[1] >= 8)) {
     S.sideSwitched = true;
@@ -688,6 +708,23 @@ function correctNumber(ti, slot, newN, isLib) {
 
 /* Tag the setter mid-match; the other five roles follow from the
    three-apart pattern and ride along through subs and rotations. */
+function setLiberoServeSpot(ti, slot) {
+  var t = S.teams[ti];
+  if (t.libServeSlot !== null && t.libServeSlot !== slot) {
+    return toast("Libero already served from " + ROMAN[t.libServeSlot] + " this set — that's locked");
+  }
+  snap();
+  if (t.libServePlan === slot) {
+    t.libServePlan = null; t.libServePlanNum = null;
+    say(t.name + ": libero serving spot cleared", "lb");
+  } else {
+    t.libServePlan = slot;
+    t.libServePlanNum = t.order[slot];
+    say(t.name + ": libero will serve in " + ROMAN[slot] + " (#" + t.order[slot] + "'s spot)", "lb");
+  }
+  save(); closeSheet(); render();
+}
+
 function setSetter(ti, slot) {
   var t = S.teams[ti];
   snap();
@@ -756,6 +793,11 @@ function confirmLineup(ti) {
   t.playerSlot = {};
   six.forEach(function (n, i) { t.playerSlot[n] = i; });
   t.liberos = libs;
+  t.libServePlan = null;
+  if (t.libServePlanNum) {
+    var pi = six.indexOf(t.libServePlanNum);
+    if (pi !== -1) t.libServePlan = pi;
+  }
   // setter carries between sets by jersey number; roles re-derive around wherever they landed
   if (t.setterNum) {
     var si = six.indexOf(t.setterNum);
@@ -1042,7 +1084,8 @@ function strip(ti) {
   return '<div class="strip"><div class="top"><span class="who" style="color:' + nameColor(ti) + '">' +
     '<span class="swatchdot" style="background:' + t.color + '"></span> ' + esc(t.name) + '</span>' +
     '<span class="counts">Subs ' + t.subs + '/' + SUB_LIMIT + ' · ' + (TIMEOUTS - t.tos) + " TO left" +
-    (t.libServeSlot !== null ? " · L serves " + ROMAN[t.libServeSlot] : "") + '</span></div>' +
+    (t.libServeSlot !== null ? " · L serves " + ROMAN[t.libServeSlot]
+      : t.libServePlan !== null ? " · L set to serve " + ROMAN[t.libServePlan] : "") + '</span></div>' +
     '<div class="acts">' +
       '<button class="btn" data-sub="' + ti + '" style="' + bs + '">Sub</button>' +
       '<button class="btn" data-libx="' + ti + '" style="' + bs + '">' + lib + '</button>' +
@@ -1258,6 +1301,18 @@ function drawSheet() {
         (onLib ? ' · libero on court here' : '') + '</p>' +
         '<button class="btn wide" data-cellfix="1">Correct this number</button>' +
         '<div style="height:8px"></div>' +
+        (t.liberos.length ? (function () {
+          var planned = t.libServePlan === cslot, locked = t.libServeSlot === cslot;
+          var other = t.libServeSlot !== null && t.libServeSlot !== cslot;
+          return '<button class="btn wide" data-libserve="1"' + (other ? " disabled" : "") + '>' +
+            (locked ? "Libero already serves here (locked)"
+                    : planned ? "✓ Libero serves here — tap to clear"
+                    : "Libero serves in this spot") + '</button>' +
+            '<p class="sub" style="margin-top:8px">' +
+            (other ? "The libero already served from " + ROMAN[t.libServeSlot] + " this set, so that spot is locked by rule."
+                   : "Pick which middle's spot the libero serves in. Auto-tracking then leaves the other middle in to serve their own turn.") +
+            '</p><div style="height:8px"></div>';
+        })() : "") +
         (onLib ? '<p class="sub">Take the libero out to tag the player underneath as setter.</p>'
                : '<button class="btn wide" data-setter="1">Tag as setter' +
                  (role === "S" ? ' (already)' : '') + '</button>' +
@@ -1376,13 +1431,14 @@ function wireOnce() {
 
     /* --- open sheet takes priority --- */
     if (sheet) {
-      var sel = e.target.closest("[data-subslot],[data-subin],[data-libin],[data-libout],[data-libpick],[data-close],[data-key],[data-cellfix],[data-cellback],[data-setter]");
+      var sel = e.target.closest("[data-subslot],[data-subin],[data-libin],[data-libout],[data-libpick],[data-close],[data-key],[data-cellfix],[data-cellback],[data-setter],[data-libserve]");
       if (sel) {
         var v;
         if (sel.getAttribute("data-close")) return closeSheet();
         if (sel.getAttribute("data-cellfix")) { sheet.mode = "fix"; sheet.buf = ""; return drawSheet(); }
         if (sel.getAttribute("data-cellback")) { sheet.mode = null; sheet.buf = ""; return drawSheet(); }
         if (sel.getAttribute("data-setter")) { return setSetter(sheet.ti, sheet.extra); }
+        if (sel.getAttribute("data-libserve")) { return setLiberoServeSpot(sheet.ti, sheet.extra); }
         if ((v = sel.getAttribute("data-subslot")) !== null) { sheet.extra = v === "back" ? null : +v; sheet.buf = ""; return drawSheet(); }
         if ((v = sel.getAttribute("data-key")) !== null) {
           var b = sheet.buf || "";
